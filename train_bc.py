@@ -3,7 +3,6 @@ PyTorch BC Training Script
 
 Offline Behavior Cloning training with periodic evaluation.
 Supports flow-based BC agents: fbc, mfbc, imfbc.
-Supports both state-based and image-based environments.
 """
 
 import os
@@ -22,7 +21,6 @@ from ml_collections import config_flags
 from log_utils import setup_wandb, get_exp_name, get_flag_dict, CsvLogger, get_wandb_video
 from envs.env_utils import make_env_and_datasets
 from envs.robomimic_utils import is_robomimic_env
-from envs.robomimic_image_utils import is_robomimic_image_env
 from utils.datasets import Dataset
 from evaluation import evaluate
 from agents import get_agent
@@ -54,15 +52,11 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_float('dataset_proportion', 1.0, 'Proportion of dataset to use.')
 flags.DEFINE_bool('sparse', False, 'Use sparse reward.')
 
-# Image environment configuration
-flags.DEFINE_integer('image_size', 84, 'Image size for image-based environments.')
-flags.DEFINE_bool('use_eye_in_hand', True, 'Use eye-in-hand camera for image-based environments.')
-
 # Agent configuration file (supports --agent=agents/fbc.py:get_config format)
 # Or use --agent.xxx to override specific parameters
 config_flags.DEFINE_config_file(
     'agent',
-    'agents/fbc.py',  # Default BC agent config file
+    'agents/imfbc.py',  # Default BC agent config file
     'Agent configuration file path (e.g., agents/fbc.py, agents/mfbc.py, agents/imfbc.py).',
     lock_config=False,
 )
@@ -113,7 +107,7 @@ def process_train_dataset(ds, env_name, dataset_proportion=1.0, sparse=False):
         ds = Dataset.create(**{k: v[:new_size] for k, v in ds.items()})
     
     # Adjust rewards for robomimic (shift from [0,1] to [-1,0])
-    if is_robomimic_env(env_name) or is_robomimic_image_env(env_name):
+    if is_robomimic_env(env_name):
         penalty_rewards = ds["rewards"] - 1.0
         ds = ds.copy(add_or_replace=dict(rewards=penalty_rewards))
     
@@ -144,22 +138,8 @@ def main(_):
     # Set seeds
     set_seed(FLAGS.seed)
     
-    # Check if image-based environment
-    is_image_env = is_robomimic_image_env(FLAGS.env_name)
-    
     # Create environment and datasets
-    env_result = make_env_and_datasets(
-        FLAGS.env_name,
-        image_size=FLAGS.image_size,
-        use_eye_in_hand=FLAGS.use_eye_in_hand,
-    )
-    
-    # Unpack results (image envs return shape_meta as 5th element)
-    if is_image_env:
-        env, eval_env, train_dataset, val_dataset, shape_meta = env_result
-    else:
-        env, eval_env, train_dataset, val_dataset = env_result
-        shape_meta = None
+    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name)
     
     # Process dataset
     train_dataset = process_train_dataset(
@@ -170,43 +150,31 @@ def main(_):
     )
     print(f"Dataset size: {train_dataset.size}")
     
-    # Get observation shape and action dim
-    if is_image_env:
-        # For image envs, use shape_meta dict
-        observation_shape = shape_meta
-        action_dim = shape_meta['action']['shape'][0]
-        print(f"Image environment detected")
-        print(f"Shape meta: {shape_meta}")
-    else:
-        # For state-based envs, use example batch
-        example_batch = train_dataset.sample(1)
-        observation_shape = example_batch['observations'].shape[1:]  # Remove batch dim
-        action_dim = example_batch['actions'].shape[-1]
-        print(f"Observation shape: {observation_shape}")
-        
-        print(f"Action dim: {action_dim}")
-        
+    # Get example batch for agent creation
+    example_batch = train_dataset.sample(1)
+    observation_shape = example_batch['observations'].shape[1:]  # Remove batch dim
+    action_dim = example_batch['actions'].shape[-1]
+    
+    print(f"Observation shape: {observation_shape}")
+    print(f"Action dim: {action_dim}")
+    
     # Get agent class and config class
     agent_name = config['agent_name']
     AgentClass, ConfigClass = get_agent(agent_name)
     print(f"Using agent: {agent_name} ({AgentClass.__name__})")
     
-    # Build agent config
-    if ConfigClass is None:
-        # Agent uses dict-based config
-        agent_config = dict(config)
-    else:
-        # Agent uses dataclass-based config
-        config_fields = {f.name for f in dataclasses.fields(ConfigClass)}
-        
-        # Only pass parameters that the ConfigClass accepts
-        config_kwargs = {}
-        for key in config.keys():
-            if key in config_fields:
-                config_kwargs[key] = config[key]
-        
-        # Create agent config
-        agent_config = ConfigClass(**config_kwargs)
+    # Build config kwargs from ml_collections config
+    # Get all fields from ConfigClass dataclass
+    config_fields = {f.name for f in dataclasses.fields(ConfigClass)}
+    
+    # Only pass parameters that the ConfigClass accepts
+    config_kwargs = {}
+    for key in config.keys():
+        if key in config_fields:
+            config_kwargs[key] = config[key]
+    
+    # Create agent config
+    agent_config = ConfigClass(**config_kwargs)
     
     # Create agent
     agent = AgentClass.create(
@@ -240,14 +208,7 @@ def main(_):
         )
         
         # Convert to torch tensors
-        def to_torch(x):
-            if isinstance(x, np.ndarray):
-                return torch.from_numpy(x).float()
-            elif isinstance(x, dict):
-                return {k: to_torch(v) for k, v in x.items()}
-            return x
-        
-        batch = {k: to_torch(v) for k, v in batch.items()}
+        batch = {k: torch.from_numpy(v).float() for k, v in batch.items()}
         
         # Update agent
         info = agent.update(batch)
