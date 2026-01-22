@@ -43,7 +43,7 @@ FLAGS = flags.FLAGS
 # Run configuration
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
-flags.DEFINE_string('env_name', 'lift-mh-low_dim', 'Environment (dataset) name.')
+flags.DEFINE_string('env_name', 'square-mh-low_dim', 'Environment (dataset) name.')
 flags.DEFINE_string('save_dir', 'runs/', 'Save directory.')
 
 # Training configuration
@@ -51,7 +51,7 @@ flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline training steps
 flags.DEFINE_integer('online_steps', 1000000, 'Number of online training steps.')
 flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
-flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
+flags.DEFINE_integer('eval_interval', 50000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', -1, 'Save interval (-1 to disable).')
 flags.DEFINE_integer('start_training', 5000, 'When to start online training.')
 
@@ -185,12 +185,17 @@ def main(_):
         # Image environment with dict observations - use shape_meta
         observation_shape = env.shape_meta if hasattr(env, 'shape_meta') else None
         if observation_shape is None:
-            # Try to get from dataset
-            from envs.robomimic_image_utils import get_shape_meta_from_dataset
-            observation_shape = get_shape_meta_from_dataset(
-                dataset_path=train_dataset.dataset_path if hasattr(train_dataset, 'dataset_path') else None,
-                obs_keys=list(example_batch['observations'].keys())
-            )
+            # Try to get from dataset (LazyImageDataset has shape_meta)
+            if hasattr(train_dataset, 'shape_meta'):
+                observation_shape = train_dataset.shape_meta
+            else:
+                # Fallback: use robomimic_utils to get shape_meta from dataset file
+                from envs.robomimic_utils import get_shape_meta_from_dataset, _check_dataset_exists_image
+                dataset_path = _check_dataset_exists_image(FLAGS.env_name)
+                observation_shape = get_shape_meta_from_dataset(
+                    dataset_path=dataset_path,
+                    obs_keys=list(example_batch['observations'].keys())
+                )
     else:
         observation_shape = example_batch['observations'].shape[1:]  # Remove batch dim
 

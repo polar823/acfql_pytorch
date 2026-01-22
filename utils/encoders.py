@@ -20,7 +20,30 @@ def at_least_ndim(x, ndim):
     return x
 
 
-class IdentityEncoder(nn.Module):
+class BaseEncoder(nn.Module):
+    """Base class for all encoders.
+
+    All encoders should inherit from this class and implement the forward method
+    with signature: forward(condition, mask) -> encoded_condition
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, condition: torch.Tensor | dict, mask: torch.Tensor = None):
+        """Encode the condition.
+
+        Args:
+            condition: Input condition (tensor or dict of tensors)
+            mask: Optional mask tensor
+
+        Returns:
+            Encoded condition tensor
+        """
+        raise NotImplementedError("Subclasses must implement forward method")
+
+
+class IdentityEncoder(BaseEncoder):
     """Identity encoder that passes through the input with optional dropout."""
 
     def __init__(self, dropout: float = 0.25):
@@ -53,7 +76,7 @@ class IdentityEncoder(nn.Module):
         return condition * mask
 
 
-class MLPEncoder(nn.Module):
+class MLPEncoder(BaseEncoder):
     """MLP encoder for low-dimensional observations."""
 
     def __init__(
@@ -147,32 +170,10 @@ def replace_submodules(
 
 
 def get_resnet(name, weights=None, **kwargs):
-    """Get ResNet model with identity final layer.
-
-    Args:
-        name: ResNet model name ('resnet18', 'resnet34', 'resnet50', etc.)
-        weights: Pretrained weights. Options:
-            - None: Random initialization
-            - 'IMAGENET1K_V1': ImageNet pretrained weights (default for torchvision)
-            - 'DEFAULT': Use default pretrained weights
-            - torchvision.models.ResNet18_Weights.IMAGENET1K_V1: Explicit weights object
-
-    Returns:
-        ResNet model with identity final layer (no classification head)
+    """name: resnet18, resnet34, resnet50
+    weights: "IMAGENET1K_V1", "r3m".
     """
     func = getattr(torchvision.models, name)
-
-    # Handle weights parameter for backward compatibility
-    if weights == 'IMAGENET1K_V1' or weights == 'DEFAULT':
-        # Get the default pretrained weights for this model
-        weights_enum_name = f"{name.upper()}_Weights"
-        if hasattr(torchvision.models, weights_enum_name):
-            weights_enum = getattr(torchvision.models, weights_enum_name)
-            weights = weights_enum.IMAGENET1K_V1
-        else:
-            # Fallback for older torchvision versions
-            weights = 'IMAGENET1K_V1'
-
     resnet = func(weights=weights, **kwargs)
     resnet.fc = torch.nn.Identity()
     return resnet
@@ -220,7 +221,7 @@ class CropRandomizer(nn.Module):
             return ttf.center_crop(inputs, (self.crop_height, self.crop_width))
 
 
-class MultiImageObsEncoder(nn.Module):
+class MultiImageObsEncoder(BaseEncoder):
     """Multi-modal observation encoder supporting both RGB and low-dim inputs.
 
     Supports pretrained vision encoders (e.g., ImageNet-pretrained ResNet) and
@@ -522,142 +523,7 @@ class MultiImageObsEncoder(nn.Module):
         return next(iter(self.parameters())).dtype
 
 
-class ResnetStack(nn.Module):
-    """ResNet stack module for IMPALA encoder."""
-    def __init__(self, in_channels, num_features, num_blocks, max_pooling=True):
-        super().__init__()
-        self.num_features = num_features
-        self.num_blocks = num_blocks
-        self.max_pooling = max_pooling
-
-        self.conv_in = nn.Conv2d(in_channels, num_features, kernel_size=3, stride=1, padding=1)
-
-        nn.init.xavier_uniform_(self.conv_in.weight)
-        if self.conv_in.bias is not None:
-            nn.init.zeros_(self.conv_in.bias)
-
-        if max_pooling:
-            self.max_pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        self.blocks = nn.ModuleList([
-            nn.ModuleDict({
-                'conv1': nn.Conv2d(num_features, num_features, kernel_size=3, stride=1, padding=1),
-                'conv2': nn.Conv2d(num_features, num_features, kernel_size=3, stride=1, padding=1)
-            })
-            for _ in range(num_blocks)
-        ])
-
-        for block in self.blocks:
-            for name, layer in block.items():
-                nn.init.xavier_uniform_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-
-        self.output_dim = num_features
-
-    def forward(self, x):
-        conv_out = self.conv_in(x)
-
-        if self.max_pooling:
-            conv_out = self.max_pool(conv_out)
-
-        # Residual Blocks
-        for block in self.blocks:
-            block_input = conv_out
-
-            out = torch.nn.functional.relu(conv_out)
-            out = block['conv1'](out)
-            out = torch.nn.functional.relu(out)
-            out = block['conv2'](out)
-
-            conv_out = out + block_input
-
-        return conv_out
 
 
-class ImpalaEncoder(nn.Module):
-    """IMPALA encoder for visual observations."""
-    def __init__(self,
-                 input_shape,  # (C, H, W)
-                 width=1,
-                 stack_sizes=(16, 32, 32),
-                 num_blocks=2,
-                 dropout_rate=None,
-                 mlp_hidden_dims=(512,),
-                 layer_norm=False):
-        super().__init__()
 
-        from utils.base_networks import MLP
 
-        self.width = width
-        self.stack_sizes = stack_sizes
-        self.num_blocks = num_blocks
-        self.dropout_rate = dropout_rate
-        self.layer_norm = layer_norm
-
-        # 1. Build Stacks
-        self.stacks = nn.ModuleList()
-        current_channels = input_shape[0]
-
-        for i, size in enumerate(stack_sizes):
-            out_channels = size * width
-            stack = ResnetStack(
-                in_channels=current_channels,
-                num_features=out_channels,
-                num_blocks=num_blocks,
-                max_pooling=True
-            )
-            self.stacks.append(stack)
-            current_channels = out_channels
-
-        # 2. Dropout
-        if dropout_rate is not None and dropout_rate > 0:
-            self.dropout = nn.Dropout(p=dropout_rate)
-        else:
-            self.dropout = None
-
-        # 3. Calculate Flatten Dim (Dummy Pass)
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, *input_shape)
-            dummy_out = self._forward_conv(dummy_input)
-            self.flatten_dim = dummy_out.reshape(1, -1).shape[1]
-
-        # 4. Layer Norm
-        if layer_norm:
-            self.ln = nn.LayerNorm(current_channels)
-        else:
-            self.ln = None
-
-        # 5. MLP
-        self.mlp = MLP(
-            input_dim=self.flatten_dim,
-            action_dim=mlp_hidden_dims[-1],
-            hidden_dim=mlp_hidden_dims[:-1] if len(mlp_hidden_dims) > 1 else (),
-            activate_final=True
-        )
-
-        self.output_dim = mlp_hidden_dims[-1]
-
-    def _forward_conv(self, x):
-        # Normalize
-        x = x.float() / 255.0
-        for stack in self.stacks:
-            x = stack(x)
-            if self.dropout is not None:
-                x = self.dropout(x)
-        return x
-
-    def forward(self, x, train=True, cond_var=None):
-        conv_out = self._forward_conv(x)
-        conv_out = torch.nn.functional.relu(conv_out)
-
-        if self.ln is not None:
-            # (N, C, H, W) -> (N, H, W, C) for LayerNorm
-            conv_out = conv_out.permute(0, 2, 3, 1)
-            conv_out = self.ln(conv_out)
-            out = conv_out.reshape(conv_out.size(0), -1)
-        else:
-            out = conv_out.reshape(conv_out.size(0), -1)
-
-        out = self.mlp(out)
-        return out

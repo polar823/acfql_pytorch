@@ -8,6 +8,7 @@ Supports:
 - Policy types: 'mlp', 'chiunet', 'chitransformer', 'jannerunet'
 - Multi-modal observations (multiple cameras + proprioceptive data)
 - Action chunking with flexible horizon lengths
+- Multiple loss types via unified loss module
 
 Config is passed as a dictionary (similar to JAX version).
 """
@@ -20,8 +21,12 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-from utils.network_factory import get_encoder, get_network
-from utils.networks import MeanActorVectorField, Value
+# New architecture components
+from utils.flow_map import FlowMap
+from utils.interpolant import Interpolant
+from utils.networks import MLP, VanillaMLP, ChiUNet, ChiTransformer, JannerUNet, Value
+from utils.encoders import IdentityEncoder, MLPEncoder, MultiImageObsEncoder
+from utils.losses import get_loss_fn, OptimizationConfig
 
 
 class MFBCAgent:
@@ -49,8 +54,23 @@ class MFBCAgent:
         config: Dict[str, Any],
         encoder: Optional[nn.Module] = None,
         critic_encoder: Optional[nn.Module] = None,
+        flow_map: Optional[FlowMap] = None,
+        interpolant: Optional[Interpolant] = None,
     ):
-        """Initialize MFBC Agent."""
+        """Initialize MFBC Agent.
+
+        Args:
+            actor: Policy network (flow model)
+            critic: Critic network (for RL fine-tuning)
+            target_critic: Target critic network
+            actor_optimizer: Optimizer for actor (and encoder if present)
+            critic_optimizer: Optimizer for critic
+            config: Configuration dictionary
+            encoder: Optional visual encoder for actor (separate from actor's internal encoder)
+            critic_encoder: Optional visual encoder for critic
+            flow_map: FlowMap wrapper for actor network
+            interpolant: Interpolant for flow matching
+        """
         self.actor = actor
         self.critic = critic
         self.target_critic = target_critic
@@ -59,6 +79,10 @@ class MFBCAgent:
         self.config = config
         self.encoder = encoder
         self.critic_encoder = critic_encoder
+
+        # Flow matching components
+        self.flow_map = flow_map
+        self.interpolant = interpolant
 
         self.device = torch.device(config['device'])
 
@@ -70,12 +94,39 @@ class MFBCAgent:
             self.encoder.to(self.device)
         if self.critic_encoder is not None:
             self.critic_encoder.to(self.device)
+        if self.flow_map is not None:
+            self.flow_map.to(self.device)
 
         # Get policy type from config (check both network_type and policy_type for compatibility)
         self.policy_type = config.get('network_type', config.get('policy_type', 'mlp'))
 
         # Training step counter
         self.step = 0
+
+        # Create OptimizationConfig for loss functions
+        self.opt_config = OptimizationConfig(
+            loss_type=config.get('loss_type', 'mf'),
+            loss_scale=config.get('loss_scale', 100.0),
+            norm_type=config.get('norm_type', 'l2'),
+            t_two_step=config.get('t_two_step', 0.9),
+            discrete_dt=config.get('discrete_dt', 0.01),
+            interp_type=config.get('interp_type', 'linear'),
+        )
+
+        # Get loss function based on loss_type
+        self.loss_fn = get_loss_fn(config.get('loss_type', 'mf'))
+
+        # Compile models for faster training (torch.compile)
+        self.use_compile = config.get('use_compile', True)
+        if self.use_compile:
+            compile_mode = config.get('compile_mode', 'default')
+            print(f"🚀 Compiling actor with torch.compile (mode={compile_mode})...")
+            self.actor = torch.compile(self.actor, mode=compile_mode)
+            if self.encoder is not None:
+                print(f"🚀 Compiling encoder with torch.compile (mode={compile_mode})...")
+                self.encoder = torch.compile(self.encoder, mode=compile_mode)
+            print("✓ Compilation complete!")
+
 
     def _encode_observations(self, observations: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
         """Encode observations using the encoder if present."""
@@ -85,12 +136,17 @@ class MFBCAgent:
     
     def actor_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute BC flow matching loss using JVP-based formulation.
+        Compute Mean Flow BC loss using unified loss module.
 
-        Uses (x_1 - x_0) as tangent vector for JVP computation.
+        Args:
+            batch: Dictionary containing:
+                - observations: (B, obs_dim) or (B, C, H, W) or Dict[str, Tensor]
+                - actions: (B, action_dim) or (B, T, action_dim) if chunking
+                - valid: (B, T) mask for action chunks (optional)
 
-        Supports both MLP-based (MeanActorVectorField) and advanced networks
-        (ChiUNet, ChiTransformer, JannerUNet).
+        Returns:
+            loss: Scalar loss
+            info: Dictionary of logging information
         """
         observations = batch['observations']
         actions = batch['actions']
@@ -102,182 +158,47 @@ class MFBCAgent:
         else:
             batch_size = observations.shape[0]
 
-        # Encode observations if using separate encoder
-        obs_emb = self._encode_observations(observations)
-
         # Handle action chunking - determine format based on policy type
         action_dim = self.config['action_dim']
         horizon_length = self.config.get('horizon_length', 1)
 
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet']:
-            # U-Net/Transformer policies expect (B, T, act_dim)
-            if actions.ndim == 2:
-                # Reshape flat actions to (B, T, act_dim)
-                batch_actions = actions.reshape(batch_size, horizon_length, action_dim)
-            else:
-                batch_actions = actions
-
-            # JVP-based flow matching
-            x_1 = torch.randn_like(batch_actions)
-            x_0 = batch_actions
-
-            # Sample time pair using logit-normal distribution
-            mu = self.config['time_logit_mu']
-            sigma = self.config['time_logit_sigma']
-            time_pair = mu + sigma * torch.randn(batch_size, 2, device=self.device)
-            time_pair = torch.sigmoid(time_pair)
-            sorted_pair, _ = torch.sort(time_pair, dim=-1)
-            t_begin = sorted_pair[:, 0]  # (B,)
-            t_end = sorted_pair[:, 1]    # (B,)
-
-            # Apply instant mask
-            instant_mask = torch.bernoulli(
-                torch.full((batch_size,), self.config['time_instant_prob'], device=self.device)
-            )
-            t_begin = torch.where(instant_mask.bool(), t_end, t_begin)
-
-            # Interpolate at t_end
-            x_t = (1 - t_end.unsqueeze(-1).unsqueeze(-1)) * x_0 + t_end.unsqueeze(-1).unsqueeze(-1) * x_1
-
-            # Compute JVP
-            def cond_mean_flow(actions_input, t_begin_input, t_end_input):
-                if self.encoder is not None:
-                    return self.actor(actions_input, t_begin_input, t_end_input, obs_emb)
-                else:
-                    return self.actor(actions_input, t_begin_input, t_end_input, observations)
-
-            tangent_actions = x_1 - x_0
-            tangent_t_begin = torch.zeros_like(t_begin)
-            tangent_t_end = torch.ones_like(t_end)
-
-            primals = (x_t, t_begin, t_end)
-            tangents = (tangent_actions, tangent_t_begin, tangent_t_end)
-
-            u, dudt = torch.autograd.functional.jvp(cond_mean_flow, primals, tangents)
-
-            # Handle scalar output from JannerUNet
-            if isinstance(u, tuple):
-                u, _ = u
-            if isinstance(dudt, tuple):
-                dudt, _ = dudt
-
-            # Compute target
-            u_tgt = (x_1 - x_0 - (t_end - t_begin).unsqueeze(-1).unsqueeze(-1) * dudt).detach()
-
-            # Predict
-            if self.encoder is not None:
-                pred = self.actor(x_t, t_begin, t_end, obs_emb)
-            else:
-                pred = self.actor(x_t, t_begin, t_end, observations)
-
-            # Handle scalar output from JannerUNet
-            if isinstance(pred, tuple):
-                pred, _ = pred
-
-            # Compute MSE loss
-            if 'valid' in batch:
-                valid = batch['valid']  # (B, T)
-                loss_per_element = (pred - u_tgt) ** 2
-                bc_flow_loss = (loss_per_element * valid.unsqueeze(-1)).mean()
-            else:
-                bc_flow_loss = ((pred - u_tgt) ** 2).mean()
+        # Prepare actions in (B, T, act_dim) format for loss functions
+        if actions.ndim == 2:
+            batch_actions = actions.reshape(batch_size, horizon_length, action_dim)
         else:
-            # MLP-based policy expects flat (B, act_dim * T)
-            if self.config['action_chunking']:
-                if actions.ndim == 3:
-                    batch_actions = actions.reshape(batch_size, -1)
-                else:
-                    batch_actions = actions
-            else:
-                if actions.ndim == 3:
-                    batch_actions = actions[:, 0, :]
-                else:
-                    batch_actions = actions
+            batch_actions = actions
 
-            action_dim = batch_actions.shape[-1]
+        # Prepare observations for encoder
+        if isinstance(observations, dict):
+            obs_for_encoder = observations
+        elif observations.ndim == 2:
+            obs_for_encoder = observations.unsqueeze(1)  # (B, 1, obs_dim)
+        else:
+            obs_for_encoder = observations
 
-            # JVP-based flow matching
-            x_1 = torch.randn_like(batch_actions)
-            x_0 = batch_actions
+        # Create delta_t tensor for loss function
+        delta_t = torch.ones(batch_size, device=self.device)
 
-            # Sample time pair using logit-normal distribution
-            mu = self.config['time_logit_mu']
-            sigma = self.config['time_logit_sigma']
-            time_pair = mu + sigma * torch.randn(batch_size, 2, device=self.device)
-            time_pair = torch.sigmoid(time_pair)
-            sorted_pair, _ = torch.sort(time_pair, dim=-1)
-            t_begin = sorted_pair[:, :1]
-            t_end = sorted_pair[:, 1:]
+        # Call unified loss function
+        bc_flow_loss, loss_info = self.loss_fn(
+            config=self.opt_config,
+            flow_map=self.flow_map,
+            encoder=self.encoder,
+            interp=self.interpolant,
+            act=batch_actions,
+            obs=obs_for_encoder,
+            delta_t=delta_t,
+        )
 
-            # Apply instant mask
-            instant_mask = torch.bernoulli(
-                torch.full((batch_size, 1), self.config['time_instant_prob'], device=self.device)
-            )
-            t_begin = torch.where(instant_mask.bool(), t_end, t_begin)
-
-            # Interpolate at t_end
-            x_t = (1 - t_end) * x_0 + t_end * x_1
-
-            # Compute JVP
-            def cond_mean_flow(actions_input, t_begin_input, t_end_input):
-                if self.encoder is not None:
-                    return self.actor(obs_emb, actions_input, t_begin_input, t_end_input, is_encoded=True)
-                else:
-                    return self.actor(observations, actions_input, t_begin_input, t_end_input)
-
-            tangent_actions = x_1 - x_0
-            tangent_t_begin = torch.zeros_like(t_begin)
-            tangent_t_end = torch.ones_like(t_end)
-
-            primals = (x_t, t_begin, t_end)
-            tangents = (tangent_actions, tangent_t_begin, tangent_t_end)
-
-            u, dudt = torch.autograd.functional.jvp(cond_mean_flow, primals, tangents)
-
-            # Apply mask for action chunking
-            if self.config['action_chunking'] and 'valid' in batch:
-                valid = batch['valid']
-                if valid.dim() == 3:
-                    valid = valid.squeeze(-1)
-
-                total_flat_dim = batch_actions.shape[-1]
-                horizon = self.config['horizon_length']
-                single_step_dim = total_flat_dim // horizon
-
-                mask_expanded = valid.unsqueeze(-1).repeat(1, 1, single_step_dim)
-                mask_flat = mask_expanded.reshape(batch_size, -1)
-                dudt = dudt * mask_flat
-
-            # Compute target
-            u_tgt = (x_1 - x_0 - (t_end - t_begin) * dudt).detach()
-
-            # Predict
-            if self.encoder is not None:
-                pred = self.actor(obs_emb, x_t, t_begin, t_end, is_encoded=True)
-            else:
-                pred = self.actor(observations, x_t, t_begin, t_end)
-
-            # Compute MSE loss
-            if self.config['action_chunking'] and 'valid' in batch:
-                valid = batch['valid']
-                if valid.dim() == 3:
-                    valid = valid.squeeze(-1)
-                loss_per_element = (pred - u_tgt) ** 2
-                loss_per_element = loss_per_element.reshape(
-                    batch_size, self.config['horizon_length'], self.config['action_dim']
-                )
-                bc_flow_loss = (loss_per_element * valid.unsqueeze(-1)).mean()
-            else:
-                bc_flow_loss = ((pred - u_tgt) ** 2).mean()
-
-        total_loss = self.config['bc_weight'] * bc_flow_loss
+        total_loss = self.config.get('bc_weight', 1.0) * bc_flow_loss
 
         info = {
             'actor_loss': total_loss.item(),
             'bc_flow_loss': bc_flow_loss.item(),
-            't_begin_mean': t_begin.mean().item() if t_begin.numel() > 0 else 0.0,
-            't_end_mean': t_end.mean().item() if t_end.numel() > 0 else 0.0,
         }
+        # Add any additional info from loss function
+        for k, v in loss_info.items():
+            info[k] = v
 
         return total_loss, info
     
@@ -312,21 +233,36 @@ class MFBCAgent:
     def _update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Single update step."""
         loss, info = self.total_loss(batch)
-        
+
         self.actor_optimizer.zero_grad()
         loss.backward()
+
+        # Apply gradient clipping (aligned with mip/config.py)
+        grad_clip_norm = self.config.get('grad_clip_norm', 10.0)
+        if grad_clip_norm > 0:
+            # Collect all parameters for gradient clipping
+            params_to_clip = list(self.actor.parameters())
+            if self.encoder is not None:
+                params_to_clip += [p for p in self.encoder.parameters() if p.requires_grad]
+            torch.nn.utils.clip_grad_norm_(params_to_clip, grad_clip_norm)
+
         self.actor_optimizer.step()
-        
+
         if self.config.get('use_critic', False):
             self.critic_optimizer.zero_grad()
             self.critic_optimizer.step()
             self.target_update()
-        
+
         self.step += 1
         return info
     
     def update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """Perform one update step."""
+
+        # Mark CUDA graph step boundary for torch.compile
+        if self.use_compile and torch.cuda.is_available():
+            torch.compiler.cudagraph_mark_step_begin()
+
         batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                  for k, v in batch.items()}
         return self._update(batch)
@@ -371,9 +307,18 @@ class MFBCAgent:
         noises: torch.Tensor,
     ):
         """
-        Compute actions using mean flow: action = noise - u(obs, noise, 0, 1).
+        Compute actions using mean flow with FlowMap.
 
-        Supports both MLP-based and advanced network types.
+        Uses ODE sampling aligned with much-ado-about-noising/mip/samplers.py:
+        - act_s = act_s + b_s * (t - s)
+        - where b_s = flow_map.get_velocity(s, act_s, obs_emb)
+
+        Args:
+            observations: Raw or encoded observations
+            noises: Initial noise tensor
+
+        Returns:
+            Predicted actions
         """
         # Encode observations if needed
         obs_emb = self._encode_observations(observations)
@@ -385,35 +330,41 @@ class MFBCAgent:
         else:
             batch_size = obs_emb.shape[0]
 
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet']:
-            # U-Net/Transformer policies work with (B, T, act_dim)
-            # noises should already be in (B, T, act_dim) format
-            times_begin = torch.zeros(batch_size, device=self.device)
-            times_end = torch.ones(batch_size, device=self.device)
 
-            if self.encoder is not None:
-                u = self.actor(noises, times_begin, times_end, obs_emb)
-            else:
-                u = self.actor(noises, times_begin, times_end, observations)
+        action_dim = self.config['action_dim']
+        horizon_length = self.config.get('horizon_length', 1)
 
-            # Handle scalar output from JannerUNet
-            if isinstance(u, tuple):
-                u, _ = u
-
-            actions = noises - u
+        # Ensure actions are in (B, T, act_dim) format for flow_map
+        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
+            actions = noises  # Already (B, T, act_dim)
         else:
-            # MLP-based policy expects flat (B, act_dim * T)
-            times_begin = torch.zeros((*noises.shape[:-1], 1), device=self.device)
-            times_end = torch.ones_like(times_begin)
+            # MLP-based policy - reshape to (B, T, act_dim)
+            actions = noises.reshape(batch_size, horizon_length, action_dim)
 
-            if self.encoder is not None:
-                u = self.actor(obs_emb, noises, times_begin, times_end, is_encoded=True)
+        # Ensure obs_emb has correct format
+        if self.encoder is not None:
+            if not isinstance(obs_emb, dict) and obs_emb.ndim == 2:
+                obs_emb = obs_emb.unsqueeze(1)  # (B, 1, emb_dim)
+            condition = obs_emb
+        else:
+            if isinstance(observations, dict):
+                condition = observations
+            elif observations.ndim == 2:
+                condition = observations.unsqueeze(1)  # (B, 1, obs_dim)
             else:
-                u = self.actor(observations, noises, times_begin, times_end)
+                condition = observations
 
-            actions = noises - u
+        s = torch.zeros(self.config['batch_size'],device=self.device)
+        t = torch.ones_like(s,device=self.device)
+        actions = self.flow_map(noises,s,t,condition)
 
+        # Clamp actions to valid range
         actions = torch.clamp(actions, -1, 1)
+
+        # Reshape back to flat format for MLP
+        if self.policy_type not in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
+            actions = actions.reshape(batch_size, -1)
+
         return actions
 
     @torch.no_grad()
@@ -453,7 +404,7 @@ class MFBCAgent:
         action_dim = self.config['action_dim']
         horizon_length = self.config.get('horizon_length', 1)
 
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet']:
+        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
             # U-Net/Transformer policies work with (B, T, act_dim)
             actions = torch.randn(batch_size, horizon_length, action_dim, device=self.device)
         else:
@@ -470,7 +421,7 @@ class MFBCAgent:
         actions = self.compute_meanflow_actions(observations, actions)
 
         # Reshape to flat format if needed
-        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet']:
+        if self.policy_type in ['chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit']:
             # (B, T, act_dim) -> (B, T * act_dim)
             actions = actions.reshape(batch_size, -1)
 
@@ -491,10 +442,12 @@ class MFBCAgent:
             save_dict['encoder'] = self.encoder.state_dict()
         if self.critic_encoder is not None:
             save_dict['critic_encoder'] = self.critic_encoder.state_dict()
+        # Note: flow_map and interpolant don't have learnable parameters,
+        # so we don't need to save them. They will be recreated on load.
 
         torch.save(save_dict, path)
         print(f"Agent saved to {path}")
-    
+
     def load(self, path: str):
         """Load agent checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
@@ -508,6 +461,7 @@ class MFBCAgent:
         if self.critic_encoder is not None and 'critic_encoder' in checkpoint:
             self.critic_encoder.load_state_dict(checkpoint['critic_encoder'])
         self.step = checkpoint.get('step', 0)
+        # Note: flow_map and interpolant are already created in __init__
         print(f"Agent loaded from {path} (step {self.step})")
     
     @classmethod
@@ -517,10 +471,32 @@ class MFBCAgent:
         action_dim: int,
         config: Dict[str, Any],
     ) -> 'MFBCAgent':
-        """Create a new MFBC agent."""
+        """
+        Create a new MFBC agent.
+
+        Args:
+            observation_shape: Shape of observations
+                - For state: (obs_dim,) tuple
+                - For images: (C, H, W) tuple
+                - For multi-image: shape_meta dict (from robomimic_image_utils)
+            action_dim: Dimension of action space
+            config: Agent configuration dictionary with keys:
+                - encoder: 'identity', 'mlp', 'image', 'impala'
+                - network_type: 'mlp', 'chiunet', 'chitransformer', 'jannerunet'
+                - emb_dim: Encoder output dimension (default 256)
+                - horizon_length: Action chunking length
+                - action_chunking: Enable action chunking
+                - time_logit_mu: Mean for time sampling (default -0.4)
+                - time_logit_sigma: Std for time sampling (default 1.0)
+                - time_instant_prob: Probability of instant time (default 0.2)
+                - ... other standard config options
+
+        Returns:
+            agent: Initialized MFBC agent
+        """
         config = dict(config)  # Copy to avoid mutation
         config['action_dim'] = action_dim
-        config['act_dim'] = action_dim  # For factory functions
+        config['act_dim'] = action_dim  # For network constructors
 
         # Set device if not specified
         if 'device' not in config:
@@ -551,17 +527,220 @@ class MFBCAgent:
         network_type = config.get('network_type', config.get('policy_type', 'mlp'))
         config['network_type'] = network_type
 
-        # Create encoder using factory
-        encoder = get_encoder(config)
-        network_input_dim = encoder.output_dim if hasattr(encoder, 'output_dim') else config.get('emb_dim', 256)
+        # ===== Create Encoder =====
+        encoder_type = config.get('encoder', 'mlp')
+        emb_dim = config.get('emb_dim', 256)
 
-        # Create policy network using factory
-        actor = get_network(config)
+        if encoder_type == 'identity':
+            encoder = IdentityEncoder(dropout=config.get('encoder_dropout', 0.25))
+            network_input_dim = config['obs_dim']
+        elif encoder_type == 'mlp':
+            encoder = MLPEncoder(
+                obs_dim=config['obs_dim'],
+                emb_dim=emb_dim,
+                To=config['To'],
+                hidden_dims=config.get('encoder_hidden_dims', [256, 256]),
+                dropout=config.get('encoder_dropout', 0.25),
+            )
+            network_input_dim = emb_dim
+        elif encoder_type == 'image':
+            # Multi-image encoder with ResNet
+            encoder = MultiImageObsEncoder(
+                shape_meta=config['shape_meta'],
+                rgb_model_name=config.get('rgb_model_name', 'resnet18'),
+                emb_dim=emb_dim,
+                resize_shape=config.get('resize_shape', None),
+                crop_shape=config.get('crop_shape', None),
+                random_crop=config.get('random_crop', True),
+                use_group_norm=config.get('use_group_norm', True),
+                share_rgb_model=config.get('share_rgb_model', False),
+                imagenet_norm=config.get('imagenet_norm', False),
+                use_seq=(config['To'] > 1),
+                keep_horizon_dims=True,  # Keep (B, To, emb_dim) format
+                pretrained=config.get('pretrained_encoder', True),
+                freeze_rgb_encoder=config.get('freeze_encoder', True),
+            )
+            network_input_dim = emb_dim
+        elif encoder_type == 'impala':
+            # Legacy IMPALA encoder
+            from utils.encoders import ImpalaEncoder
+            if is_visual:
+                input_shape = observation_shape if not is_multi_image else (3, 84, 84)
+                encoder = ImpalaEncoder(
+                    input_shape=input_shape,
+                    width=1,
+                    stack_sizes=(16, 32, 32),
+                    num_blocks=2,
+                    mlp_hidden_dims=(emb_dim,),
+                )
+                network_input_dim = emb_dim
+            else:
+                encoder = IdentityEncoder(dropout=config.get('encoder_dropout', 0.25))
+                network_input_dim = config['obs_dim']
+        else:
+            raise ValueError(f"Unknown encoder type: {encoder_type}")
 
-        # Create critic encoder (separate from actor encoder)
-        critic_encoder = get_encoder(config)
+        print(f"✓ Created encoder: {encoder_type} (output_dim={network_input_dim})")
 
-        # Create critic
+        # ===== Create Policy Network =====
+        if network_type == 'mlp':
+            actor = MLP(
+                act_dim=action_dim,
+                Ta=horizon_length,
+                obs_dim=network_input_dim,
+                To=config['To'],
+                emb_dim=config.get('actor_emb_dim', 512),
+                n_layers=len(config.get('actor_hidden_dims', (512, 512, 512, 512))),
+                timestep_emb_dim=config.get('time_encoder_dim', 128),
+                disable_time_embedding=config.get('disable_time_embedding', False),
+                dropout=config.get('dropout', 0.1),
+            )
+        elif network_type == 'vanillamlp':
+            actor = VanillaMLP(
+                act_dim=action_dim,
+                Ta=horizon_length,
+                obs_dim=network_input_dim,
+                To=config['To'],
+                emb_dim=config.get('actor_emb_dim', 512),
+                n_layers=len(config.get('actor_hidden_dims', (512, 512, 512, 512))),
+                dropout=config.get('dropout', 0.1),
+                expansion_factor=config.get('expansion_factor', 1),
+            )
+        elif network_type == 'chiunet':
+            actor = ChiUNet(
+                act_dim=action_dim,
+                Ta=horizon_length,
+                obs_dim=network_input_dim,
+                To=config['To'],
+                emb_dim=config.get('model_dim', 256),
+                kernel_size=config.get('kernel_size', 5),
+                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
+                timestep_emb_params=config.get('timestep_emb_params', None),
+                cond_predict_scale=config.get('cond_predict_scale', True),
+                obs_as_global_cond=config.get('obs_as_global_cond', True),
+                dim_mult=config.get('dim_mult', [1, 2]),
+                disable_time_embedding=config.get('disable_time_embedding', False),
+            )
+        elif network_type == 'chitransformer':
+            actor = ChiTransformer(
+                act_dim=action_dim,
+                Ta=horizon_length,
+                obs_dim=network_input_dim,
+                To=config['To'],
+                d_model=config.get('d_model', 256),
+                nhead=config.get('nhead', 4),
+                num_layers=config.get('num_layers', 8),
+                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
+                timestep_emb_params=config.get('timestep_emb_params', None),
+                p_drop_emb=config.get('p_drop_emb', 0.0),
+                p_drop_attn=config.get('p_drop_attn', 0.3),
+                n_cond_layers=config.get('n_cond_layers', 0),
+            )
+        elif network_type == 'jannerunet':
+            actor = JannerUNet(
+                act_dim=action_dim,
+                Ta=horizon_length,
+                obs_dim=network_input_dim,
+                To=config['To'],
+                emb_dim=config.get('model_dim', 256),
+                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
+                timestep_emb_params=config.get('timestep_emb_params', None),
+                norm_type=config.get('unet_norm_type', 'groupnorm'),
+                attention=config.get('attention', False),
+            )
+        elif network_type == 'rnn':
+            from utils.networks import RNN
+            actor = RNN(
+                act_dim=action_dim,
+                Ta=horizon_length,
+                obs_dim=network_input_dim,
+                To=config['To'],
+                rnn_hidden_dim=config.get('emb_dim', 256),
+                rnn_num_layers=config.get('n_layers', 2),
+                rnn_type=config.get('rnn_type', 'LSTM'),
+                timestep_emb_dim=config.get('timestep_emb_dim', 128),
+                max_freq=config.get('max_freq', 100.0),
+                dropout=config.get('dropout', 0.1),
+            )
+        elif network_type == 'vanillarnn':
+            from utils.networks import VanillaRNN
+            actor = VanillaRNN(
+                act_dim=action_dim,
+                Ta=horizon_length,
+                obs_dim=network_input_dim,
+                To=config['To'],
+                rnn_hidden_dim=config.get('emb_dim', 256),
+                rnn_num_layers=config.get('n_layers', 2),
+                rnn_type=config.get('rnn_type', 'LSTM'),
+                dropout=config.get('dropout', 0.1),
+            )
+        elif network_type == 'dit':
+            from utils.networks import DiT
+            actor = DiT(
+                act_dim=action_dim,
+                Ta=horizon_length,
+                obs_dim=network_input_dim,
+                To=config['To'],
+                d_model=config.get('emb_dim', 384),
+                n_heads=config.get('n_heads', 6),
+                depth=config.get('n_layers', 12),
+                dropout=config.get('dropout', 0.0),
+                timestep_emb_type=config.get('timestep_emb_type', 'positional'),
+            )
+        else:
+            raise ValueError(f"Unknown network type: {network_type}. Supported: mlp, vanillamlp, chiunet, chitransformer, jannerunet, rnn, vanillarnn, dit")
+
+        print(f"✓ Created policy network: {network_type}")
+
+        # ===== Create FlowMap and Interpolant =====
+        flow_map = FlowMap(actor)
+        interpolant = Interpolant(interp_type=config.get('interp_type', 'linear'))
+        print(f"✓ Created FlowMap with {config.get('interp_type', 'linear')} interpolant")
+
+        # ===== Create Critic Encoder (separate from actor encoder) =====
+        if encoder_type == 'identity':
+            critic_encoder = IdentityEncoder(dropout=config.get('encoder_dropout', 0.25))
+        elif encoder_type == 'mlp':
+            critic_encoder = MLPEncoder(
+                obs_dim=config['obs_dim'],
+                emb_dim=emb_dim,
+                To=config['To'],
+                hidden_dims=config.get('encoder_hidden_dims', [256, 256]),
+                dropout=config.get('encoder_dropout', 0.25),
+            )
+        elif encoder_type == 'image':
+            critic_encoder = MultiImageObsEncoder(
+                shape_meta=config['shape_meta'],
+                rgb_model_name=config.get('rgb_model_name', 'resnet18'),
+                emb_dim=emb_dim,
+                resize_shape=config.get('resize_shape', None),
+                crop_shape=config.get('crop_shape', None),
+                random_crop=config.get('random_crop', True),
+                use_group_norm=config.get('use_group_norm', True),
+                share_rgb_model=config.get('share_rgb_model', False),
+                imagenet_norm=config.get('imagenet_norm', False),
+                use_seq=(config['To'] > 1),
+                keep_horizon_dims=True,
+                pretrained=config.get('pretrained_encoder', True),
+                freeze_rgb_encoder=config.get('freeze_encoder', True),
+            )
+        elif encoder_type == 'impala':
+            from utils.encoders import ImpalaEncoder
+            if is_visual:
+                input_shape = observation_shape if not is_multi_image else (3, 84, 84)
+                critic_encoder = ImpalaEncoder(
+                    input_shape=input_shape,
+                    width=1,
+                    stack_sizes=(16, 32, 32),
+                    num_blocks=2,
+                    mlp_hidden_dims=(emb_dim,),
+                )
+            else:
+                critic_encoder = IdentityEncoder(dropout=config.get('encoder_dropout', 0.25))
+        else:
+            raise ValueError(f"Unknown encoder type: {encoder_type}")
+
+        # ===== Create Critic =====
         full_action_dim = action_dim * horizon_length if config.get('action_chunking', True) else action_dim
         critic = Value(
             observation_dim=network_input_dim,
@@ -572,28 +751,36 @@ class MFBCAgent:
             layer_norm=config.get('layer_norm', True),
         )
 
+        # Create target critic
         target_critic = copy.deepcopy(critic)
 
-        # Create optimizers
-        lr = config.get('lr', 3e-4)
-        weight_decay = config.get('weight_decay', 0.0)
+        # ===== Create Optimizers =====
+        lr = config.get('lr', 1e-4)
+        weight_decay = config.get('weight_decay', 1e-5)
 
-        # Collect parameters for actor optimizer (includes encoder)
+        # Collect parameters for actor optimizer (includes encoder and flow_map)
+        # Only include parameters that require gradients (exclude frozen encoder)
         actor_params = list(actor.parameters())
         if encoder is not None:
-            actor_params += list(encoder.parameters())
+            encoder_params = [p for p in encoder.parameters() if p.requires_grad]
+            actor_params += encoder_params
+
+            # Print parameter counts
+            total_encoder_params = sum(p.numel() for p in encoder.parameters())
+            trainable_encoder_params = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+            if trainable_encoder_params < total_encoder_params:
+                print(f"  Encoder: {trainable_encoder_params:,} / {total_encoder_params:,} parameters trainable "
+                      f"({100 * trainable_encoder_params / total_encoder_params:.1f}%)")
 
         # Collect parameters for critic optimizer
         critic_params = list(critic.parameters())
         if critic_encoder is not None:
-            critic_params += list(critic_encoder.parameters())
+            critic_encoder_params = [p for p in critic_encoder.parameters() if p.requires_grad]
+            critic_params += critic_encoder_params
 
-        if weight_decay > 0:
-            actor_optimizer = optim.AdamW(actor_params, lr=lr, weight_decay=weight_decay)
-            critic_optimizer = optim.AdamW(critic_params, lr=lr, weight_decay=weight_decay)
-        else:
-            actor_optimizer = optim.Adam(actor_params, lr=lr)
-            critic_optimizer = optim.Adam(critic_params, lr=lr)
+        # Always use AdamW with weight_decay (aligned with mip/config.py)
+        actor_optimizer = optim.AdamW(actor_params, lr=lr, weight_decay=weight_decay)
+        critic_optimizer = optim.AdamW(critic_params, lr=lr, weight_decay=weight_decay)
 
         return cls(
             actor=actor,
@@ -604,6 +791,8 @@ class MFBCAgent:
             config=config,
             encoder=encoder,
             critic_encoder=critic_encoder,
+            flow_map=flow_map,
+            interpolant=interpolant,
         )
 
 
@@ -613,8 +802,15 @@ def get_config():
     return ml_collections.ConfigDict(
         dict(
             agent_name='mfbc',
-            lr=3e-4,
-            batch_size=256,
+            lr=1e-4,  # Learning rate (aligned with mip/config.py)
+            batch_size=1024,  # Batch size (aligned with mip/config.py)
+            weight_decay=1e-5,  # Weight decay (aligned with mip/config.py)
+
+            # New parameters from mip/config.py
+            grad_clip_norm=10.0,  # Gradient clipping norm
+            ema_rate=0.995,  # EMA rate for model averaging
+            loss_scale=100.0,  # Loss scaling factor
+            norm_type='l2',  # 'l2' or 'l1'
 
             # Encoder configuration
             encoder='mlp',  # Encoder type: 'identity', 'mlp', 'image', 'impala'
@@ -633,15 +829,18 @@ def get_config():
             imagenet_norm=False,  # Use ImageNet normalization
 
             # Network configuration
-            network_type='mlp',  # Network: 'mlp', 'chiunet', 'chitransformer', 'jannerunet'
+            network_type='mlp',  # Network: 'mlp', 'vanillamlp', 'chiunet', 'chitransformer', 'jannerunet', 'rnn', 'vanillarnn', 'dit'
+            n_layers=4,  # Number of layers (aligned with mip/config.py)
             actor_hidden_dims=(512, 512, 512, 512),  # For MLP network
+            actor_layer_norm=True,  # Enable LayerNorm in actor MLP (matches JAX implementation)
+            expansion_factor=4,  # Expansion factor for MLP (aligned with mip/config.py)
 
             # ChiUNet-specific
             model_dim=256,
             kernel_size=5,
             cond_predict_scale=True,
             obs_as_global_cond=True,
-            dim_mult=[1, 2, 2],
+            dim_mult=[1, 2],  # Reduced depth for small horizon_length (4 or 8)
 
             # ChiTransformer-specific
             d_model=256,
@@ -651,25 +850,35 @@ def get_config():
             n_cond_layers=0,
 
             # JannerUNet-specific
-            norm_type='groupnorm',
+            unet_norm_type='groupnorm',
             attention=False,
+
+            # RNN-specific
+            rnn_type='LSTM',  # 'LSTM' or 'GRU'
+            max_freq=100.0,
+
+            # DiT-specific
+            n_heads=6,
 
             # Common network settings
             value_hidden_dims=(512, 512, 512, 512),
             layer_norm=True,
-            actor_layer_norm=False,
 
             # Training
             discount=0.99,
             tau=0.005,
             num_qs=2,
             flow_steps=10,
-            weight_decay=0.0,
             use_critic=False,
             bc_weight=1.0,
 
+            # Compilation and optimization
+            use_compile=True,  # Enable torch.compile for faster training
+            compile_mode='default',  # Compile mode: 'default', 'reduce-overhead', 'max-autotune'
+            use_dataloader=True,  # Use PyTorch DataLoader for multi-process data loading
+
             # Action chunking
-            horizon_length=5,
+            horizon_length=16,
             action_chunking=True,
             obs_steps=1,  # Observation context length
 
@@ -678,11 +887,20 @@ def get_config():
             fourier_feature_dim=64,
             timestep_emb_type='positional',
             timestep_emb_params=None,
+            timestep_emb_dim=128,
             disable_time_embedding=False,
 
             # MFBC specific
             time_logit_mu=-0.4,
             time_logit_sigma=1.0,
             time_instant_prob=0.2,
+
+            # Loss type configuration
+            loss_type='mf',  # 'flow', 'regression', 'tsd', 'mip', 'lmd', 'ctm', 'psd', 'lsd', 'esd', 'mf'
+            t_two_step=0.9,  # For tsd/mip loss
+            discrete_dt=0.01,  # For ctm loss
+
+            # Flow
+            interp_type='linear',  # Interpolant type: 'linear' or 'trig'
         )
     )

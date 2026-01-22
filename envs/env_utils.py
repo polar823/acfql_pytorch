@@ -129,35 +129,15 @@ def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5, imag
         eval_env = d4rl_utils.make_env(env_name)
         dataset = d4rl_utils.get_dataset(env, env_name)
         train_dataset, val_dataset = dataset, None
-    elif '-image' in env_name:
-        # RoboMimic Image-based.
-        from envs import robomimic_image_utils
-
-        env, eval_env, train_dataset, shape_meta = robomimic_image_utils.make_env_and_dataset_image(
-            env_name, seed=0, image_size=image_size, use_eye_in_hand=use_eye_in_hand
-        )
-        val_dataset = None
     elif env_name.startswith("lift") or env_name.startswith("can") or env_name.startswith("square") or \
         env_name.startswith("transport") or env_name.startswith("tool_hang"):
         # RoboMimic (auto-detect low_dim or image based on env_name).
         from envs import robomimic_utils
 
-        # Check if this is an image environment (has -image suffix or no -low_dim suffix)
-        if '-image' in env_name:
-            # Image environment - use robomimic_image_utils
-            from envs import robomimic_image_utils
-            env, eval_env, train_dataset, shape_meta = robomimic_image_utils.make_env_and_dataset_image(
-                env_name, seed=0, image_size=image_size, use_eye_in_hand=use_eye_in_hand
-            )
-            val_dataset = None
-        else:
-            # Low-dim environment - use robomimic_utils
-            env = robomimic_utils.make_env(env_name, seed=0)
-            eval_env = robomimic_utils.make_env(env_name, seed=42)
-            env = EpisodeMonitor(env)
-            eval_env = EpisodeMonitor(eval_env)
-            dataset = robomimic_utils.get_dataset(env, env_name)
-            train_dataset, val_dataset = dataset, None
+        # Use make_env_and_dataset which handles both low_dim and image
+        result = robomimic_utils.make_env_and_dataset(env_name, seed=0)
+        env, eval_env, train_dataset, shape_meta = result
+        val_dataset = None
     else:
         raise ValueError(f'Unsupported environment: {env_name}')
 

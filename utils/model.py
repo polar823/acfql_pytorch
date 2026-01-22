@@ -316,7 +316,7 @@ class ActorVectorField(nn.Module):
     def __init__(self, observation_dim, action_dim, hidden_dim=(512,512,512,512),
                  encoder=None, time_encoder="sinusoidal", time_encoder_dim=64,
                  use_fourier_features=False, fourier_feature_dim=64,
-                 use_time=True):
+                 use_time=True, layer_norm=False):
         super(ActorVectorField, self).__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
@@ -347,7 +347,7 @@ class ActorVectorField(nn.Module):
         else:
             self.time_encoder = None
 
-        self.mlp = MLP(self.input_dim, self.action_dim, hidden_dim=hidden_dim)
+        self.mlp = MLP(self.input_dim, self.action_dim, hidden_dim=hidden_dim, layer_norm=layer_norm)
     
     def forward(self, o, x_t, t=None, is_encoded=False):
         """Forward pass.
@@ -367,11 +367,25 @@ class ActorVectorField(nn.Module):
             if not isinstance(t, torch.Tensor):
                 t = torch.tensor(t, device=observations.device).float()
 
-            # Ensure t is 1D for time encoder
+            # Ensure t has correct shape for time encoder
+            # Time encoder expects (batch_size,) shape
             if t.dim() == 0:
-                t = t.unsqueeze(0)
+                # Scalar: expand to match batch size
+                batch_size = observations.shape[0]
+                t = t.unsqueeze(0).expand(batch_size)
+            elif t.dim() == 1:
+                # Already 1D, check if it needs expansion
+                if t.shape[0] == 1 and observations.shape[0] > 1:
+                    t = t.expand(observations.shape[0])
+            elif t.dim() == 2 and t.shape[1] == 1:
+                # (batch, 1) -> (batch,)
+                t = t.squeeze(1)
             elif t.dim() > 1:
+                # Multi-dimensional, squeeze to 1D
                 t = t.squeeze()
+                if t.dim() == 0:
+                    batch_size = observations.shape[0]
+                    t = t.unsqueeze(0).expand(batch_size)
 
             # Apply time encoder
             time_emb = self.time_encoder(t)
@@ -402,7 +416,7 @@ class MeanActorVectorField(nn.Module):
 
     def __init__(self, observation_dim, action_dim, hidden_dim=(512,512,512,512),
                  encoder=None, time_encoder="sinusoidal", time_encoder_dim=64,
-                 use_fourier_features=False, fourier_feature_dim=64):
+                 use_fourier_features=False, fourier_feature_dim=64, layer_norm=False):
         super(MeanActorVectorField, self).__init__()
         self.observation_dim = observation_dim
         self.action_dim = action_dim
@@ -427,7 +441,7 @@ class MeanActorVectorField(nn.Module):
         # Input: observations + actions + time_begin_emb + time_end_emb
         self.input_dim += self.action_dim + time_encoder_dim * 2
 
-        self.mlp = MLP(self.input_dim, self.action_dim, hidden_dim=hidden_dim)
+        self.mlp = MLP(self.input_dim, self.action_dim, hidden_dim=hidden_dim, layer_norm=layer_norm)
 
     def forward(self, observations, x_t, t_begin, t_end, is_encoded=False):
         """Forward pass.
@@ -447,16 +461,35 @@ class MeanActorVectorField(nn.Module):
         if not isinstance(t_end, torch.Tensor):
             t_end = torch.tensor(t_end, device=observations.device).float()
 
-        # Ensure times are 1D for time encoder
+        # Ensure times have correct shape for time encoder
+        # Time encoder expects (batch_size,) shape
+        batch_size = observations.shape[0]
+
+        # Process t_begin
         if t_begin.dim() == 0:
-            t_begin = t_begin.unsqueeze(0)
+            t_begin = t_begin.unsqueeze(0).expand(batch_size)
+        elif t_begin.dim() == 1:
+            if t_begin.shape[0] == 1 and batch_size > 1:
+                t_begin = t_begin.expand(batch_size)
+        elif t_begin.dim() == 2 and t_begin.shape[1] == 1:
+            t_begin = t_begin.squeeze(1)
         elif t_begin.dim() > 1:
             t_begin = t_begin.squeeze()
+            if t_begin.dim() == 0:
+                t_begin = t_begin.unsqueeze(0).expand(batch_size)
 
+        # Process t_end
         if t_end.dim() == 0:
-            t_end = t_end.unsqueeze(0)
+            t_end = t_end.unsqueeze(0).expand(batch_size)
+        elif t_end.dim() == 1:
+            if t_end.shape[0] == 1 and batch_size > 1:
+                t_end = t_end.expand(batch_size)
+        elif t_end.dim() == 2 and t_end.shape[1] == 1:
+            t_end = t_end.squeeze(1)
         elif t_end.dim() > 1:
             t_end = t_end.squeeze()
+            if t_end.dim() == 0:
+                t_end = t_end.unsqueeze(0).expand(batch_size)
 
         # Apply time encoders
         t_begin_emb = self.time_encoder_begin(t_begin)

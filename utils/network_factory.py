@@ -56,6 +56,7 @@ def get_network(config: dict):
                 time_encoder_dim=time_encoder_dim,
                 use_fourier_features=config.get('use_fourier_features', False),
                 fourier_feature_dim=config.get('fourier_feature_dim', 64),
+                layer_norm=config.get('actor_layer_norm', True),  # Enable layer norm by default
             )
         else:
             # Use standard ActorVectorField for regular flow matching
@@ -67,6 +68,7 @@ def get_network(config: dict):
                 time_encoder_dim=time_encoder_dim,
                 use_fourier_features=config.get('use_fourier_features', False),
                 fourier_feature_dim=config.get('fourier_feature_dim', 64),
+                layer_norm=config.get('actor_layer_norm', True),  # Enable layer norm by default
             )
 
     elif network_type == 'chiunet':
